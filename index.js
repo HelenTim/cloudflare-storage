@@ -218,12 +218,13 @@ const html = `<!DOCTYPE html>
             return auth
         }
 
+        // 统一以 Authorization: Bearer <token> 形式携带凭据，与 Worker 端校验保持一致
         function addAuthHeader(xhr, auth) {
-            xhr.setRequestHeader('X-Custom-Auth-Key', auth);  // 添加认证头
+            xhr.setRequestHeader('Authorization', 'Bearer ' + auth);
         }
 
         function ifAuthFail(xhr) {
-            if (xhr.status === 403) {
+            if (xhr.status === 401 || xhr.status === 403) {
                 localStorage.removeItem('auth')
             }
         }
@@ -314,8 +315,52 @@ const html = `<!DOCTYPE html>
 
 </html>`;
 
+// 校验 Authorization: Bearer <token>，token 由 Worker 的 secret AUTH_KEY_SECRET 提供
+// AUTH_HEADERS 从环境变量传入，JSON 字符串：[[headerName, valueTemplate], ...]
+// valueTemplate 支持 ${NAME} / ${env.NAME} 占位符，运行时从 env 取值，避免把密钥写死在配置里
+// 任意一条规则匹配即通过；未配置规则、或占位符对应的变量不存在，该条规则视为不匹配（fail closed）
+let cachedRaw;
+let cachedRules;
+
+function getAuthRules(env) {
+	const raw = env.AUTH_HEADERS || '';
+	if (raw === cachedRaw) return cachedRules;
+
+	let parsed;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		parsed = [];
+	}
+
+	cachedRules = (Array.isArray(parsed) ? parsed : [])
+		.filter((rule) => Array.isArray(rule) && rule.length >= 2 && typeof rule[0] === 'string')
+		.map(([name, expected]) => ({ name, expected: String(expected) }));
+	cachedRaw = raw;
+	return cachedRules;
+}
+
+// 解析占位符；任一占位符找不到对应变量时返回 null，避免解析成空串后误判通过
+function resolveExpected(value, env) {
+	let ok = true;
+	const resolved = value.replace(/\$\{(?:env\.)?([A-Za-z0-9_]+)\}/g, (_, name) => {
+		if (typeof env[name] !== 'string' || env[name] === '') {
+			ok = false;
+			return '';
+		}
+		return env[name];
+	});
+	return ok ? resolved : null;
+}
+
 const hasValidHeader = (request, env) => {
-	return request.headers.get('X-Custom-Auth-Key') === env.AUTH_KEY_SECRET;
+	const rules = getAuthRules(env);
+	return rules.some(({ name, expected }) => {
+		const actual = request.headers.get(name);
+		if (actual === null) return false;
+		const want = resolveExpected(expected, env);
+		return want !== null && actual === want;
+	});
 };
 
 function authorizeRequest(request, env, key) {
@@ -329,6 +374,7 @@ function authorizeRequest(request, env, key) {
 			return false;
 	}
 }
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -338,7 +384,7 @@ export default {
     }
     if (request.method === 'GET') {
       // Serve the HTML page
-      if (url.pathname === '/' && request.headers.get('Accept').includes('text/html')) {
+      if (url.pathname === '/' && (request.headers.get('Accept') || '').includes('text/html')) {
         return new Response(html, {
           headers: { 'Content-Type': 'text/html' },
         });
@@ -358,7 +404,7 @@ export default {
       // Handle file download
       if (key) {
         const object = await env.FILE_BUCKET.get(key);
-        
+
         if (object === null) {
           return new Response('File not found', { status: 404 });
         }
@@ -377,7 +423,7 @@ export default {
       const object = await request.arrayBuffer();
       await env.FILE_BUCKET.put(key, object, {
         httpMetadata: request.headers,
-      }); 
+      });
       return new Response('File uploaded successfully', { status: 200 });
     }
     if (request.method === 'DELETE') {
